@@ -85,13 +85,24 @@ function calculateItemBasePrice(item) {
   return MENU[category]?.[item.base_item]?.[sizeKey] || 0;
 }
 
+function normalizeQty(value) {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) && n >= 1 ? n : 1;
+}
+
+function getItemQuantity(item) {
+  const q = item.quantity ?? item.modifications?.Quantity ?? item.modifications?.quantity;
+  return normalizeQty(q);
+}
+
 function getItemLineTotal(item) {
   const basePrice = calculateItemBasePrice(item);
   let modsPrice = 0;
   Object.entries(item.modifications || {}).forEach(([mod, qty]) => {
-    modsPrice += (MENU.add_ons[mod] || 0) * qty;
+    if (mod === 'Quantity' || mod === 'quantity') return;
+    modsPrice += (MENU.add_ons[mod] || 0) * normalizeQty(qty);
   });
-  return basePrice + modsPrice;
+  return (basePrice + modsPrice) * getItemQuantity(item);
 }
 
 const SYSTEM_PROMPT = `You are a fast, efficient NYC Coffee AI Cashier. 
@@ -113,15 +124,19 @@ Rules:
 Items: Americano, Latte, Cold Brew, Mocha, Coffee Frappuccino, Black Tea, Jasmine Tea, Lemon Green Tea, Matcha Latte, Plain Croissant, Chocolate Croissant, Chocolate Chip Cookie, Banana Bread (Slice).
 
 JSON structure:
+- Every item MUST have "quantity": integer (number of this line item, e.g. 10 cookies = 10). Minimum 1.
+- Every modification value MUST be an integer (quantity of that add-on, e.g. 2 extra shots = 2). Minimum 1.
 {
   "customerName": "string",
   "items": [{
     "base_item": "Exact Item Name",
+    "quantity": 1,
     "size": "Small (12oz)" | "Large (16oz)" | "N/A",
     "temp": "Hot" | "Iced" | "N/A",
-    "modifications": {"Mod Name": quantity}
+    "modifications": {"Mod Name": 1}
   }]
 }
+Example: 2 Lattes with 1 extra shot each -> quantity: 2, modifications: {"Extra Espresso Shot": 1}. Example: 10 Chocolate Chip Cookies -> quantity: 10, modifications: {}.
 
 ====
 
@@ -289,12 +304,21 @@ const CustomerView = () => {
   };
 
   const finalizeOrder = async (orderData) => {
-    const itemsForPayload = orderData.items.map(item => ({
-      base_item: item.base_item,
-      size: item.size,
-      temp: item.temp,
-      modifications: item.modifications || {}
-    }));
+    const itemsForPayload = orderData.items.map(item => {
+      const mods = item.modifications || {};
+      const normalizedMods = {};
+      Object.entries(mods).forEach(([k, v]) => {
+        if (k === 'Quantity' || k === 'quantity') return;
+        normalizedMods[k] = normalizeQty(v);
+      });
+      return {
+        base_item: item.base_item,
+        quantity: getItemQuantity(item),
+        size: item.size,
+        temp: item.temp,
+        modifications: normalizedMods
+      };
+    });
     const subtotal = itemsForPayload.reduce((sum, item) => sum + getItemLineTotal(item), 0);
     const tax = subtotal * TAX_RATE;
     const grandTotal = subtotal + tax;
@@ -495,29 +519,34 @@ const CustomerView = () => {
           </div>
 
           <div className="flex-1 space-y-6 mb-8 overflow-y-auto">
-            {receipt.items.map((item, i) => (
-              <div key={i} className="border-b border-stone-50 pb-4">
-                <div className="flex justify-between items-start mb-1">
-                  <div className="font-bold text-stone-900">
-                    {item.base_item} 
-                    {item.size !== "N/A" && <span className="text-stone-400 font-normal ml-1">({item.size})</span>}
+            {receipt.items.map((item, i) => {
+              const lineQty = getItemQuantity(item);
+              const modsToShow = Object.entries(item.modifications || {}).filter(([mod]) => mod !== 'Quantity' && mod !== 'quantity');
+              return (
+                <div key={i} className="border-b border-stone-50 pb-4">
+                  <div className="flex justify-between items-start mb-1">
+                    <div className="font-bold text-stone-900">
+                      {item.base_item}
+                      {lineQty > 1 && <span className="text-stone-500 font-normal ml-1">x{lineQty}</span>}
+                      {item.size !== "N/A" && <span className="text-stone-400 font-normal ml-1">({item.size})</span>}
+                    </div>
+                    <div className="font-mono text-stone-600">${getItemLineTotal(item).toFixed(2)}</div>
                   </div>
-                  <div className="font-mono text-stone-600">${calculateItemBasePrice(item).toFixed(2)}</div>
+                  <div className="space-y-1">
+                    {item.temp !== "N/A" && <div className="text-xs text-stone-400 uppercase tracking-wider">{item.temp}</div>}
+                    {modsToShow.map(([mod, qty]) => {
+                      const cost = (MENU.add_ons[mod] || 0) * qty;
+                      return (
+                        <div key={mod} className="flex justify-between text-xs font-medium text-amber-700">
+                          <span>+ {mod} {qty > 1 ? `x${qty}` : ''}</span>
+                          {cost > 0 && <span>+${cost.toFixed(2)}</span>}
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
-                <div className="space-y-1">
-                  {item.temp !== "N/A" && <div className="text-xs text-stone-400 uppercase tracking-wider">{item.temp}</div>}
-                  {Object.entries(item.modifications || {}).map(([mod, qty]) => {
-                    const cost = (MENU.add_ons[mod] || 0) * qty;
-                    return (
-                      <div key={mod} className="flex justify-between text-xs font-medium text-amber-700">
-                        <span>+ {mod} {qty > 1 ? `x${qty}` : ''}</span>
-                        {cost > 0 && <span>+${cost.toFixed(2)}</span>}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
 
           <div className="space-y-2 border-t pt-6">
@@ -716,17 +745,21 @@ const BaristaView = () => {
                 </span>
               </div>
               <div className="space-y-4 mb-8">
-                {order.items.map((item, idx) => (
-                  <div key={idx} className="bg-stone-50 p-3 rounded-2xl">
-                    <p className="font-black text-stone-800 leading-tight">{item.base_item} {item.size !== "N/A" ? `(${item.size})` : ''}</p>
-                    <div className="mt-2 space-y-0.5">
-                      {item.temp !== "N/A" && <p className="text-[10px] font-bold text-stone-400 uppercase tracking-widest">{item.temp}</p>}
-                      {Object.entries(item.modifications || {}).map(([k,v]) => (
-                        <p key={k} className="text-xs font-bold text-amber-700">• {k} {v > 1 ? `x${v}` : ''}</p>
-                      ))}
+                {order.items.map((item, idx) => {
+                  const lineQty = getItemQuantity(item);
+                  const modsToShow = Object.entries(item.modifications || {}).filter(([k]) => k !== 'Quantity' && k !== 'quantity');
+                  return (
+                    <div key={idx} className="bg-stone-50 p-3 rounded-2xl">
+                      <p className="font-black text-stone-800 leading-tight">{item.base_item}{lineQty > 1 ? ` x${lineQty}` : ''} {item.size !== "N/A" ? `(${item.size})` : ''}</p>
+                      <div className="mt-2 space-y-0.5">
+                        {item.temp !== "N/A" && <p className="text-[10px] font-bold text-stone-400 uppercase tracking-widest">{item.temp}</p>}
+                        {modsToShow.map(([k,v]) => (
+                          <p key={k} className="text-xs font-bold text-amber-700">• {k} {v > 1 ? `x${v}` : ''}</p>
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
               <div className="flex gap-2">
                 {order.status === 'not_started' ? (
@@ -754,17 +787,21 @@ const BaristaView = () => {
                       <span className="text-[10px] font-black px-3 py-1.5 rounded-full uppercase tracking-widest bg-stone-100 text-stone-400">completed</span>
                     </div>
                     <div className="space-y-4">
-                      {order.items.map((item, idx) => (
-                        <div key={idx} className="bg-stone-50 p-3 rounded-2xl">
-                          <p className="font-black text-stone-800 leading-tight">{item.base_item} {item.size !== "N/A" ? `(${item.size})` : ''}</p>
-                          <div className="mt-2 space-y-0.5">
-                            {item.temp !== "N/A" && <p className="text-[10px] font-bold text-stone-400 uppercase tracking-widest">{item.temp}</p>}
-                            {Object.entries(item.modifications || {}).map(([k,v]) => (
-                              <p key={k} className="text-xs font-bold text-amber-700">• {k} {v > 1 ? `x${v}` : ''}</p>
-                            ))}
+                      {order.items.map((item, idx) => {
+                        const lineQty = getItemQuantity(item);
+                        const modsToShow = Object.entries(item.modifications || {}).filter(([k]) => k !== 'Quantity' && k !== 'quantity');
+                        return (
+                          <div key={idx} className="bg-stone-50 p-3 rounded-2xl">
+                            <p className="font-black text-stone-800 leading-tight">{item.base_item}{lineQty > 1 ? ` x${lineQty}` : ''} {item.size !== "N/A" ? `(${item.size})` : ''}</p>
+                            <div className="mt-2 space-y-0.5">
+                              {item.temp !== "N/A" && <p className="text-[10px] font-bold text-stone-400 uppercase tracking-widest">{item.temp}</p>}
+                              {modsToShow.map(([k,v]) => (
+                                <p key={k} className="text-xs font-bold text-amber-700">• {k} {v > 1 ? `x${v}` : ''}</p>
+                              ))}
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 ))}
@@ -820,9 +857,9 @@ const OwnerView = () => {
     filtered.forEach(o => {
       o.items.forEach(i => {
         if (!itemCounts[i.base_item]) itemCounts[i.base_item] = { qty: 0, sales: 0 };
-        itemCounts[i.base_item].qty += 1;
+        itemCounts[i.base_item].qty += getItemQuantity(i);
         itemCounts[i.base_item].sales += getItemLineTotal(i);
-        Object.keys(i.modifications || {}).forEach(m => modCounts[m] = (modCounts[m] || 0) + 1);
+        Object.keys(i.modifications || {}).filter(m => m !== 'Quantity' && m !== 'quantity').forEach(m => modCounts[m] = (modCounts[m] || 0) + 1);
       });
     });
 
