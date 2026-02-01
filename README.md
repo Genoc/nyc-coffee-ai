@@ -31,6 +31,21 @@ You need **two** things: a **Gemini API key** (for the AI cashier) and **Google 
 
 ---
 
+### 3. ElevenLabs (optional – voice input/output)
+
+You can use **ElevenLabs** for speech-to-text and text-to-speech instead of the browser’s built-in APIs. In the Order view, turn on **Voice** and use the **Browser** / **ElevenLabs** toggle to switch. **STT streams** as you talk and commits when you pause (no need to press stop).
+
+| What | Env variable | Where it’s used |
+|------|----------------|------------------|
+| API key (server) | `ELEVENLABS_API_KEY` | Server only (issues single-use Scribe tokens for streaming STT; never sent to the client) |
+| API key (frontend) | `VITE_ELEVENLABS_API_KEY` | Frontend (TTS only when ElevenLabs is selected) |
+| Voice ID (optional) | `VITE_ELEVENLABS_VOICE_ID` | Frontend (TTS voice; default is Rachel) |
+
+- **Local:** In `.env` add `ELEVENLABS_API_KEY=your_elevenlabs_key` (for streaming STT) and `VITE_ELEVENLABS_API_KEY=your_elevenlabs_key` (for TTS). Optional: `VITE_ELEVENLABS_VOICE_ID=voice_id` from [ElevenLabs Voices](https://elevenlabs.io/app/voice-library).
+- **Railway:** Add `ELEVENLABS_API_KEY` and `VITE_ELEVENLABS_API_KEY` (and optional `VITE_ELEVENLABS_VOICE_ID`), then rebuild.
+
+---
+
 ### 2. Google Sheets (orders backend)
 
 | What | Env variable | Where it’s used |
@@ -93,6 +108,12 @@ To make the Orders sheet readable, add a header row (row 1) with:
 Or run once (with the same env vars set):  
 `node server/init-sheet.js`
 
+**Testing Owner timeframe filters**
+
+To add fake orders so the Owner "yesterday" and "7d" views show data, run:  
+`npm run seed:orders`  
+(from project root with `.env` set). This appends simulated completed orders to the sheet; it does not delete existing data.
+
 ---
 
 ## Install and run
@@ -101,10 +122,36 @@ Or run once (with the same env vars set):
 npm install
 ```
 
-**Development** (two terminals):
+---
 
-- Terminal 1: `npm run dev:server` — API on port 3001
-- Terminal 2: `npm run dev` — Vite dev server (proxies `/api` to 3001)
+## Run locally (no Railway)
+
+Use this to test changes locally so you don’t have to redeploy to Railway every time.
+
+1. **Create a `.env` file** in the project root with the same variables you use on Railway:
+   ```bash
+   VITE_GEMINI_API_KEY=your_gemini_key
+   GOOGLE_SHEET_ID=your_sheet_id
+   GOOGLE_APPLICATION_CREDENTIALS_JSON={"type":"service_account",...}
+   ```
+
+2. **Open two terminals** in the project root.
+
+3. **Terminal 1 — API server** (loads `.env`, serves `/api` on port 3001):
+   ```bash
+   npm run dev:server
+   ```
+   Leave this running.
+
+4. **Terminal 2 — Frontend** (Vite dev server; proxies `/api` to the API):
+   ```bash
+   npm run dev
+   ```
+
+5. **Open the app** at **http://localhost:5173** (Vite’s default).  
+   The frontend talks to the API via the proxy, so ordering, Barista queue, and Owner stats all work against your Google Sheet.
+
+Edits to the React app hot-reload. If you change `server/` code, restart **Terminal 1** (`Ctrl+C`, then `npm run dev:server` again).
 
 **Production (e.g. Railway):**
 

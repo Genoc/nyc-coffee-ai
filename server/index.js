@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -100,6 +101,30 @@ app.post('/api/orders', async (req, res) => {
   } catch (err) {
     console.error('POST /api/orders', err);
     res.status(500).json({ error: err.message || 'Failed to create order' });
+  }
+});
+
+// GET /api/elevenlabs-scribe-token — single-use token for client-side Scribe Realtime WebSocket (do not expose API key)
+app.get('/api/elevenlabs-scribe-token', async (req, res) => {
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  if (!apiKey) {
+    return res.status(503).json({ error: 'ElevenLabs not configured (missing ELEVENLABS_API_KEY)' });
+  }
+  try {
+    const response = await fetch('https://api.elevenlabs.io/v1/single-use-token/realtime_scribe', {
+      method: 'POST',
+      headers: { 'xi-api-key': apiKey },
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('ElevenLabs token error', response.status, errText);
+      return res.status(response.status).json({ error: 'Failed to get Scribe token' });
+    }
+    const data = await response.json();
+    res.json({ token: data.token });
+  } catch (err) {
+    console.error('GET /api/elevenlabs-scribe-token', err);
+    res.status(500).json({ error: err.message || 'Failed to get token' });
   }
 });
 

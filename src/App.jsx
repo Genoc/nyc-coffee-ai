@@ -16,6 +16,27 @@ import {
 // --- Configuration & Constants ---
 const API_BASE = import.meta.env.VITE_API_BASE || '';
 const apiKey = import.meta.env.VITE_GEMINI_API_KEY || '';
+const ELEVENLABS_API_KEY = import.meta.env.VITE_ELEVENLABS_API_KEY || '';
+const ELEVENLABS_VOICE_ID = import.meta.env.VITE_ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
+
+// Resample Float32 mono to 16kHz and return Int16 PCM as base64 (for ElevenLabs Scribe Realtime)
+function resampleAndEncodePCM16(float32, sourceRate = 48000, targetRate = 16000) {
+  const ratio = sourceRate / targetRate;
+  const outLength = Math.floor(float32.length / ratio);
+  const out = new Int16Array(outLength);
+  for (let i = 0; i < outLength; i++) {
+    const srcIdx = i * ratio;
+    const j = Math.floor(srcIdx);
+    const f = srcIdx - j;
+    const sample = j + 1 < float32.length ? float32[j] * (1 - f) + float32[j + 1] * f : float32[j];
+    const s = Math.max(-1, Math.min(1, sample));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+  const b = new Uint8Array(out.buffer);
+  let binary = '';
+  for (let i = 0; i < b.length; i++) binary += String.fromCharCode(b[i]);
+  return btoa(binary);
+}
 const TAX_RATE = 0.08875;
 
 const MENU = {
@@ -43,7 +64,7 @@ const MENU = {
     "Skim Milk": 0.00,
     "Oat Milk": 0.50,
     "Almond Milk": 0.75,
-    "Extra Espresso Shot": 0.75, // Updated per user request
+    "Extra Espresso Shot": 1.50,
     "Extra Matcha Shot": 1.50,
     "1 Pump Caramel Syrup": 0.50,
     "1 Pump Hazelnut Syrup": 0.50,
@@ -56,15 +77,36 @@ const MENU = {
   }
 };
 
+function calculateItemBasePrice(item) {
+  const isPastry = MENU.pastry[item.base_item];
+  if (isPastry) return isPastry.price;
+  const category = MENU.coffee[item.base_item] ? 'coffee' : 'tea';
+  const sizeKey = item.size?.toLowerCase?.().includes('small') ? 'small' : 'large';
+  return MENU[category]?.[item.base_item]?.[sizeKey] || 0;
+}
+
+function getItemLineTotal(item) {
+  const basePrice = calculateItemBasePrice(item);
+  let modsPrice = 0;
+  Object.entries(item.modifications || {}).forEach(([mod, qty]) => {
+    modsPrice += (MENU.add_ons[mod] || 0) * qty;
+  });
+  return basePrice + modsPrice;
+}
+
 const SYSTEM_PROMPT = `You are a fast, efficient NYC Coffee AI Cashier. 
 Rules:
 1. MAX 3 espresso shots per drink.
 2. Frappuccinos are ONLY ICED. Decline hot requests.
-3. Tea drinks can have sweetness levels: No Sugar, Less Sugar, Extra Sugar.
-4. Gather: Item (from menu), Size (Small (12oz) / Large (16oz)), Temp (Hot/Iced), and Mods.
-5. Pastries do not need a size or temperature.
-6. Ask for the Customer's Name at the end.
-7. Output JSON inside <order_json>...</order_json> tags.
+3. All drinks can have sweetness levels: No Sugar, Less Sugar, Extra Sugar.
+4. Gather: Item (from menu), Size (Small 12oz or Large 16oz), and Temp (Hot/Iced). Do not proactively ask about other mods, let the customer specify others if they want them (e.g. sweetness or extra shots).
+5. After confirming the details of an item (name + modifications), ask the customer if they would like anything else. Do not rush them to complete the order.
+6. Pastries do not need a size or temperature.
+7. Ask for the Customer's Name at the end.
+8. Output JSON inside <order_json>...</order_json> tags.
+9. Do not ask unecessary questions or talk too much. Focus on being succinct and to the point, but still friendly and polite.
+10. If a customer asks for the order total, only give the total, you don't need to provide it by item.
+11. If the customer asks for the price of specific items, give them the base item price as well as the prices of any modifications (e.g. extra shots).
 
 Items: Americano, Latte, Cold Brew, Mocha, Coffee Frappuccino, Black Tea, Jasmine Tea, Lemon Green Tea, Matcha Latte, Plain Croissant, Chocolate Croissant, Chocolate Chip Cookie, Banana Bread (Slice).
 
@@ -78,6 +120,50 @@ JSON structure:
     "modifications": {"Mod Name": quantity}
   }]
 }
+
+====
+
+Here is information on the menu and the pricing, in case the customer asks:
+
+const TAX_RATE = 0.08875;
+
+const MENU = {
+  coffee: {
+    "Americano": { small: 3.00, large: 4.00 },
+    "Latte": { small: 4.00, large: 5.00 },
+    "Cold Brew": { small: 4.00, large: 5.00 },
+    "Mocha": { small: 4.50, large: 5.50 },
+    "Coffee Frappuccino": { small: 5.50, large: 6.00 }
+  },
+  tea: {
+    "Black Tea": { small: 3.00, large: 3.75 },
+    "Jasmine Tea": { small: 3.00, large: 3.75 },
+    "Lemon Green Tea": { small: 3.50, large: 4.25 },
+    "Matcha Latte": { small: 4.50, large: 5.25 }
+  },
+  pastry: {
+    "Plain Croissant": { price: 3.50 },
+    "Chocolate Croissant": { price: 4.00 },
+    "Chocolate Chip Cookie": { price: 2.50 },
+    "Banana Bread (Slice)": { price: 3.00 }
+  },
+  add_ons: {
+    "Whole Milk": 0.00,
+    "Skim Milk": 0.00,
+    "Oat Milk": 0.50,
+    "Almond Milk": 0.75,
+    "Extra Espresso Shot": 1.50,
+    "Extra Matcha Shot": 1.50,
+    "1 Pump Caramel Syrup": 0.50,
+    "1 Pump Hazelnut Syrup": 0.50,
+    "No Sugar": 0.00,
+    "Less Sugar": 0.00,
+    "Extra Sugar": 0.00,
+    "No Ice": 0.00,
+    "Less Ice": 0.00,
+    "Extra Ice": 0.00
+  }
+};
 `;
 
 const Header = ({ activeView, setView }) => (
@@ -113,23 +199,26 @@ const CustomerView = () => {
   const [messages, setMessages] = useState([{ role: 'assistant', text: "Welcome to NYC Coffee! What can I get for you?" }]);
   const [inputText, setInputText] = useState('');
   const [isVoice, setIsVoice] = useState(false);
+  const [voiceProvider, setVoiceProvider] = useState('browser');
   const [isListening, setIsListening] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [receipt, setReceipt] = useState(null);
   const scrollRef = useRef(null);
   const recognitionRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const streamRef = useRef(null);
+  const scribeWsRef = useRef(null);
+  const scribeAudioContextRef = useRef(null);
+  const scribeProcessorRef = useRef(null);
+  const scribeChunkBufferRef = useRef([]);
+  const SCRIBE_TARGET_SAMPLE_RATE = 16000;
+  const SCRIBE_CHUNK_DURATION_MS = 120;
+  const SCRIBE_SAMPLES_PER_CHUNK = Math.floor((SCRIBE_CHUNK_DURATION_MS / 1000) * SCRIBE_TARGET_SAMPLE_RATE);
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
-
-  const calculateItemBasePrice = (item) => {
-    const isPastry = MENU.pastry[item.base_item];
-    if (isPastry) return isPastry.price;
-    const category = MENU.coffee[item.base_item] ? 'coffee' : 'tea';
-    const sizeKey = item.size.toLowerCase().includes('small') ? 'small' : 'large';
-    return MENU[category]?.[item.base_item]?.[sizeKey] || 0;
-  };
 
   const callGeminiWithRetry = async (payload, retries = 5, delay = 1000) => {
     try {
@@ -187,18 +276,13 @@ const CustomerView = () => {
   };
 
   const finalizeOrder = async (orderData) => {
-    let subtotal = 0;
-    const itemsWithPrices = orderData.items.map(item => {
-      const basePrice = calculateItemBasePrice(item);
-      let modsPrice = 0;
-      Object.entries(item.modifications || {}).forEach(([mod, qty]) => {
-        modsPrice += (MENU.add_ons[mod] || 0) * qty;
-      });
-      const itemTotal = basePrice + modsPrice;
-      subtotal += itemTotal;
-      return { ...item, basePrice, price: itemTotal };
-    });
-
+    const itemsForPayload = orderData.items.map(item => ({
+      base_item: item.base_item,
+      size: item.size,
+      temp: item.temp,
+      modifications: item.modifications || {}
+    }));
+    const subtotal = itemsForPayload.reduce((sum, item) => sum + getItemLineTotal(item), 0);
     const tax = subtotal * TAX_RATE;
     const grandTotal = subtotal + tax;
 
@@ -209,7 +293,7 @@ const CustomerView = () => {
       grand_total: grandTotal,
       status: 'not_started',
       created_at: new Date().toISOString(),
-      items: itemsWithPrices
+      items: itemsForPayload
     };
 
     try {
@@ -224,14 +308,119 @@ const CustomerView = () => {
     } catch (err) { console.error("Save Error", err); }
   };
 
-  const speak = (text) => {
-    if (!window.speechSynthesis) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    window.speechSynthesis.speak(utterance);
+  const speak = async (text) => {
+    if (!text?.trim()) return;
+    if (voiceProvider === 'elevenlabs' && ELEVENLABS_API_KEY) {
+      try {
+        const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+          method: 'POST',
+          headers: {
+            'xi-api-key': ELEVENLABS_API_KEY,
+            'Content-Type': 'application/json',
+            Accept: 'audio/mpeg'
+          },
+          body: JSON.stringify({ text: text.trim(), model_id: 'eleven_multilingual_v2' })
+        });
+        if (!res.ok) throw new Error('TTS failed');
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        audio.onended = () => URL.revokeObjectURL(url);
+        await audio.play();
+      } catch (err) {
+        console.error('ElevenLabs TTS', err);
+      }
+      return;
+    }
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      window.speechSynthesis.speak(utterance);
+    }
   };
 
-  const startListening = () => {
+  const startListening = async () => {
+    if (voiceProvider === 'elevenlabs') {
+      try {
+        const tokenRes = await fetch(`${API_BASE}/api/elevenlabs-scribe-token`);
+        if (!tokenRes.ok) {
+          const err = await tokenRes.json().catch(() => ({}));
+          console.error('Scribe token failed', err);
+          return;
+        }
+        const { token } = await tokenRes.json();
+        if (!token) {
+          console.error('No Scribe token in response');
+          return;
+        }
+        const wsUrl = `wss://api.elevenlabs.io/v1/speech-to-text/realtime?token=${encodeURIComponent(token)}&model_id=scribe_v2_realtime&commit_strategy=vad&audio_format=pcm_16000`;
+        const ws = new WebSocket(wsUrl);
+        scribeWsRef.current = ws;
+        scribeChunkBufferRef.current = [];
+
+        ws.onopen = async () => {
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            streamRef.current = stream;
+            const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+            scribeAudioContextRef.current = ctx;
+            const source = ctx.createMediaStreamSource(stream);
+            const bufferSize = 2048;
+            const processor = ctx.createScriptProcessor(bufferSize, 1, 1);
+            scribeProcessorRef.current = processor;
+
+            processor.onaudioprocess = (e) => {
+              if (ws.readyState !== WebSocket.OPEN) return;
+              const input = e.inputBuffer.getChannelData(0);
+              const b64 = resampleAndEncodePCM16(input, ctx.sampleRate, SCRIBE_TARGET_SAMPLE_RATE);
+              const newSamples = Math.floor(input.length * SCRIBE_TARGET_SAMPLE_RATE / ctx.sampleRate);
+              const buf = scribeChunkBufferRef.current;
+              buf.push({ b64, samples: newSamples });
+              let total = buf.reduce((s, c) => s + c.samples, 0);
+              while (total >= SCRIBE_SAMPLES_PER_CHUNK && buf.length > 0) {
+                const first = buf.shift();
+                total -= first.samples;
+                try {
+                  ws.send(JSON.stringify({
+                    message_type: 'input_audio_chunk',
+                    audio_base_64: first.b64,
+                    sample_rate: SCRIBE_TARGET_SAMPLE_RATE
+                  }));
+                } catch (_) {}
+              }
+            };
+            source.connect(processor);
+            processor.connect(ctx.destination);
+            setIsListening(true);
+          } catch (err) {
+            console.error('Microphone / Scribe pipeline', err);
+            ws.close();
+          }
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.message_type === 'committed_transcript' && data.text?.trim()) {
+              handleSendMessage(data.text.trim());
+            }
+          } catch (_) {}
+        };
+
+        ws.onerror = () => { setIsListening(false); };
+        ws.onclose = () => {
+          setIsListening(false);
+          const stream = streamRef.current;
+          if (stream) stream.getTracks().forEach((t) => t.stop());
+          scribeAudioContextRef.current?.close();
+          scribeProcessorRef.current = null;
+          scribeWsRef.current = null;
+        };
+      } catch (err) {
+        console.error('ElevenLabs Scribe connect', err);
+      }
+      return;
+    }
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) return;
     recognitionRef.current = new SpeechRecognition();
@@ -243,6 +432,17 @@ const CustomerView = () => {
     };
     recognitionRef.current.onend = () => setIsListening(false);
     recognitionRef.current.start();
+  };
+
+  const stopListening = () => {
+    if (voiceProvider === 'elevenlabs' && scribeWsRef.current) {
+      scribeWsRef.current.close();
+      scribeProcessorRef.current?.disconnect();
+      scribeAudioContextRef.current?.close();
+      streamRef.current?.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    if (recognitionRef.current) recognitionRef.current.stop();
   };
 
   return (
@@ -265,7 +465,7 @@ const CustomerView = () => {
                     {item.base_item} 
                     {item.size !== "N/A" && <span className="text-stone-400 font-normal ml-1">({item.size})</span>}
                   </div>
-                  <div className="font-mono text-stone-600">${item.basePrice.toFixed(2)}</div>
+                  <div className="font-mono text-stone-600">${calculateItemBasePrice(item).toFixed(2)}</div>
                 </div>
                 <div className="space-y-1">
                   {item.temp !== "N/A" && <div className="text-xs text-stone-400 uppercase tracking-wider">{item.temp}</div>}
@@ -319,26 +519,51 @@ const CustomerView = () => {
             <div ref={scrollRef} />
           </div>
 
-          <div className="bg-white p-3 rounded-3xl shadow-xl border border-stone-100 flex items-center gap-3">
-            <button 
-              onClick={() => {
-                if (isVoice && recognitionRef.current) recognitionRef.current.stop();
-                setIsVoice(!isVoice);
-              }}
-              className={`p-3.5 rounded-2xl transition-all ${isVoice ? 'bg-amber-100 text-amber-600' : 'bg-stone-100 text-stone-400'}`}
-            >
-              {isVoice ? <Mic size={22} /> : <MessageSquare size={22} />}
-            </button>
-            
-            {isVoice ? (
+          <div className="bg-white p-3 rounded-3xl shadow-xl border border-stone-100 flex flex-col gap-3">
+            {isVoice && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-stone-400 uppercase tracking-wider">Voice:</span>
+                <div className="flex bg-stone-100 p-0.5 rounded-xl">
+                  <button
+                    type="button"
+                    onClick={() => !isListening && setVoiceProvider('browser')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${voiceProvider === 'browser' ? 'bg-white shadow text-stone-900' : 'text-stone-500 hover:text-stone-700'}`}
+                  >
+                    Browser
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => !isListening && setVoiceProvider('elevenlabs')}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${voiceProvider === 'elevenlabs' ? 'bg-white shadow text-stone-900' : 'text-stone-500 hover:text-stone-700'}`}
+                  >
+                    ElevenLabs
+                  </button>
+                </div>
+              </div>
+            )}
+            <div className="flex items-center gap-3">
               <button 
-                onClick={isListening ? () => recognitionRef.current.stop() : startListening}
-                className={`flex-1 flex items-center justify-center gap-3 py-3.5 rounded-2xl font-black transition-all ${isListening ? 'bg-red-500 text-white animate-pulse' : 'bg-stone-900 text-white hover:bg-stone-800'}`}
+                onClick={() => {
+                  if (isVoice && isListening) stopListening();
+                  if (isVoice && voiceProvider === 'elevenlabs' && streamRef.current) {
+                    streamRef.current.getTracks().forEach((t) => t.stop());
+                  }
+                  setIsVoice(!isVoice);
+                }}
+                className={`p-3.5 rounded-2xl transition-all ${isVoice ? 'bg-amber-100 text-amber-600' : 'bg-stone-100 text-stone-400'}`}
               >
-                {isListening ? <MicOff size={20} /> : <Mic size={20} />}
-                {isListening ? "Listening..." : "Start Talking"}
+                {isVoice ? <Mic size={22} /> : <MessageSquare size={22} />}
               </button>
-            ) : (
+              
+              {isVoice ? (
+                <button 
+                  onClick={isListening ? stopListening : startListening}
+                  className={`flex-1 flex items-center justify-center gap-3 py-3.5 rounded-2xl font-black transition-all ${isListening ? 'bg-red-500 text-white animate-pulse' : 'bg-stone-900 text-white hover:bg-stone-800'}`}
+                >
+                  {isListening ? <MicOff size={20} /> : <Mic size={20} />}
+                  {isListening ? "Listening..." : "Start Talking"}
+                </button>
+              ) : (
               <div className="flex-1 flex items-center bg-stone-50 rounded-2xl pr-2">
                 <input 
                   type="text"
@@ -353,6 +578,7 @@ const CustomerView = () => {
                 </button>
               </div>
             )}
+            </div>
           </div>
         </>
       )}
@@ -394,7 +620,36 @@ const BaristaView = () => {
 
   const active = orders.filter(o => o.status !== 'completed');
   const history = orders.filter(o => o.status === 'completed');
-  const display = tab === 'active' ? active : history;
+
+  const historyByDay = useMemo(() => {
+    const map = {};
+    history.forEach((o) => {
+      const d = new Date(o.created_at);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      if (!map[key]) map[key] = [];
+      map[key].push(o);
+    });
+    return Object.entries(map)
+      .sort((a, b) => b[0].localeCompare(a[0]))
+      .map(([key, dayOrders]) => ({ key, orders: dayOrders }));
+  }, [history]);
+
+  const todayKey = useMemo(() => {
+    const n = new Date();
+    return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
+  }, []);
+  const yesterdayKey = useMemo(() => {
+    const n = new Date();
+    n.setDate(n.getDate() - 1);
+    return `${n.getFullYear()}-${String(n.getMonth() + 1).padStart(2, '0')}-${String(n.getDate()).padStart(2, '0')}`;
+  }, []);
+
+  const dayLabel = (key) => {
+    if (key === todayKey) return 'Today';
+    if (key === yesterdayKey) return 'Yesterday';
+    const [y, m, d] = key.split('-').map(Number);
+    return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+  };
 
   return (
     <div className="max-w-4xl mx-auto p-6">
@@ -410,32 +665,32 @@ const BaristaView = () => {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        {display.map(order => (
-          <div key={order.id} className={`bg-white rounded-3xl p-6 shadow-sm border-l-[12px] transition-all ${order.status === 'in_progress' ? 'border-amber-400' : 'border-stone-200'}`}>
-            <div className="flex justify-between items-start mb-6">
-              <div>
-                <h3 className="text-xl font-black text-stone-900 uppercase tracking-tight">{order.customerName || 'Guest'}</h3>
-                <p className="text-xs font-bold text-stone-400 mt-1">{order.created_at ? new Date(order.created_at).toLocaleTimeString() : ''}</p>
-              </div>
-              <span className={`text-[10px] font-black px-3 py-1.5 rounded-full uppercase tracking-widest ${order.status === 'in_progress' ? 'bg-amber-100 text-amber-700' : 'bg-stone-100 text-stone-400'}`}>
-                {order.status.replace('_', ' ')}
-              </span>
-            </div>
-            <div className="space-y-4 mb-8">
-              {order.items.map((item, idx) => (
-                <div key={idx} className="bg-stone-50 p-3 rounded-2xl">
-                  <p className="font-black text-stone-800 leading-tight">{item.base_item} {item.size !== "N/A" ? `(${item.size})` : ''}</p>
-                  <div className="mt-2 space-y-0.5">
-                    {item.temp !== "N/A" && <p className="text-[10px] font-bold text-stone-400 uppercase tracking-widest">{item.temp}</p>}
-                    {Object.entries(item.modifications || {}).map(([k,v]) => (
-                      <p key={k} className="text-xs font-bold text-amber-700">• {k} {v > 1 ? `x${v}` : ''}</p>
-                    ))}
-                  </div>
+      {tab === 'active' ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          {active.map(order => (
+            <div key={order.id} className={`bg-white rounded-3xl p-6 shadow-sm border-l-[12px] transition-all ${order.status === 'in_progress' ? 'border-amber-400' : 'border-stone-200'}`}>
+              <div className="flex justify-between items-start mb-6">
+                <div>
+                  <h3 className="text-xl font-black text-stone-900 uppercase tracking-tight">{order.customerName || 'Guest'}</h3>
+                  <p className="text-xs font-bold text-stone-400 mt-1">{order.created_at ? new Date(order.created_at).toLocaleTimeString() : ''}</p>
                 </div>
-              ))}
-            </div>
-            {tab === 'active' && (
+                <span className={`text-[10px] font-black px-3 py-1.5 rounded-full uppercase tracking-widest ${order.status === 'in_progress' ? 'bg-amber-100 text-amber-700' : 'bg-stone-100 text-stone-400'}`}>
+                  {order.status.replace('_', ' ')}
+                </span>
+              </div>
+              <div className="space-y-4 mb-8">
+                {order.items.map((item, idx) => (
+                  <div key={idx} className="bg-stone-50 p-3 rounded-2xl">
+                    <p className="font-black text-stone-800 leading-tight">{item.base_item} {item.size !== "N/A" ? `(${item.size})` : ''}</p>
+                    <div className="mt-2 space-y-0.5">
+                      {item.temp !== "N/A" && <p className="text-[10px] font-bold text-stone-400 uppercase tracking-widest">{item.temp}</p>}
+                      {Object.entries(item.modifications || {}).map(([k,v]) => (
+                        <p key={k} className="text-xs font-bold text-amber-700">• {k} {v > 1 ? `x${v}` : ''}</p>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
               <div className="flex gap-2">
                 {order.status === 'not_started' ? (
                   <button onClick={() => updateStatus(order.id, 'in_progress')} className="flex-1 py-3 bg-stone-900 text-white rounded-xl font-black uppercase tracking-wider text-xs">Start Prep</button>
@@ -443,10 +698,44 @@ const BaristaView = () => {
                   <button onClick={() => updateStatus(order.id, 'completed')} className="flex-1 py-3 bg-green-600 text-white rounded-xl font-black uppercase tracking-wider text-xs">Complete Order</button>
                 )}
               </div>
-            )}
-          </div>
-        ))}
-      </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-10">
+          {historyByDay.map(({ key, orders: dayOrders }) => (
+            <section key={key}>
+              <h3 className="text-sm font-black text-stone-400 uppercase tracking-widest mb-4">{dayLabel(key)}</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                {dayOrders.map((order) => (
+                  <div key={order.id} className="bg-white rounded-3xl p-6 shadow-sm border-l-[12px] border-stone-200">
+                    <div className="flex justify-between items-start mb-6">
+                      <div>
+                        <h3 className="text-xl font-black text-stone-900 uppercase tracking-tight">{order.customerName || 'Guest'}</h3>
+                        <p className="text-xs font-bold text-stone-400 mt-1">{order.created_at ? new Date(order.created_at).toLocaleTimeString() : ''}</p>
+                      </div>
+                      <span className="text-[10px] font-black px-3 py-1.5 rounded-full uppercase tracking-widest bg-stone-100 text-stone-400">completed</span>
+                    </div>
+                    <div className="space-y-4">
+                      {order.items.map((item, idx) => (
+                        <div key={idx} className="bg-stone-50 p-3 rounded-2xl">
+                          <p className="font-black text-stone-800 leading-tight">{item.base_item} {item.size !== "N/A" ? `(${item.size})` : ''}</p>
+                          <div className="mt-2 space-y-0.5">
+                            {item.temp !== "N/A" && <p className="text-[10px] font-bold text-stone-400 uppercase tracking-widest">{item.temp}</p>}
+                            {Object.entries(item.modifications || {}).map(([k,v]) => (
+                              <p key={k} className="text-xs font-bold text-amber-700">• {k} {v > 1 ? `x${v}` : ''}</p>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      )}
     </div>
   );
 };
@@ -495,7 +784,7 @@ const OwnerView = () => {
       o.items.forEach(i => {
         if (!itemCounts[i.base_item]) itemCounts[i.base_item] = { qty: 0, sales: 0 };
         itemCounts[i.base_item].qty += 1;
-        itemCounts[i.base_item].sales += i.price;
+        itemCounts[i.base_item].sales += getItemLineTotal(i);
         Object.keys(i.modifications || {}).forEach(m => modCounts[m] = (modCounts[m] || 0) + 1);
       });
     });
