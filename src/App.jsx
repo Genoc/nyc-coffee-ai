@@ -105,8 +105,10 @@ Rules:
 7. Ask for the Customer's Name at the end.
 8. Output JSON inside <order_json>...</order_json> tags.
 9. Do not ask unecessary questions or talk too much. Focus on being succinct and to the point, but still friendly and polite.
-10. If a customer asks for the order total, only give the total, you don't need to provide it by item.
-11. If the customer asks for the price of specific items, give them the base item price as well as the prices of any modifications (e.g. extra shots).
+10. If the customer asks for the price of specific items or of the order so far, give them the base item price as well as the prices of any modifications (e.g. extra shots).
+11. Once the order is done, only say "Thank you for ordering, please come again!". Do not mention an order total.
+12. Payment is always done in store, do not ask for payment method.
+13. Orders can never have empty items. Never send an order if there is nothing in it.
 
 Items: Americano, Latte, Cold Brew, Mocha, Coffee Frappuccino, Black Tea, Jasmine Tea, Lemon Green Tea, Matcha Latte, Plain Croissant, Chocolate Croissant, Chocolate Chip Cookie, Banana Bread (Slice).
 
@@ -195,8 +197,10 @@ const Header = ({ activeView, setView }) => (
   </header>
 );
 
+const INITIAL_MESSAGES = [{ role: 'assistant', text: "Welcome to NYC Coffee! What can I get for you?" }];
+
 const CustomerView = () => {
-  const [messages, setMessages] = useState([{ role: 'assistant', text: "Welcome to NYC Coffee! What can I get for you?" }]);
+  const [messages, setMessages] = useState(INITIAL_MESSAGES);
   const [inputText, setInputText] = useState('');
   const [isVoice, setIsVoice] = useState(false);
   const [voiceProvider, setVoiceProvider] = useState('browser');
@@ -212,9 +216,16 @@ const CustomerView = () => {
   const scribeAudioContextRef = useRef(null);
   const scribeProcessorRef = useRef(null);
   const scribeChunkBufferRef = useRef([]);
+  const ttsAudioRef = useRef(null);
+  const ttsObjectUrlRef = useRef(null);
   const SCRIBE_TARGET_SAMPLE_RATE = 16000;
   const SCRIBE_CHUNK_DURATION_MS = 120;
   const SCRIBE_SAMPLES_PER_CHUNK = Math.floor((SCRIBE_CHUNK_DURATION_MS / 1000) * SCRIBE_TARGET_SAMPLE_RATE);
+  const messagesRef = useRef(INITIAL_MESSAGES);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -241,12 +252,14 @@ const CustomerView = () => {
   const handleSendMessage = async (text) => {
     if (!text.trim()) return;
     const userMsg = { role: 'user', text };
+    const historyForRequest = [...messagesRef.current, userMsg];
+    messagesRef.current = historyForRequest;
     setMessages(prev => [...prev, userMsg]);
     setInputText('');
     setIsLoading(true);
 
     const payload = {
-      contents: [...messages, userMsg].map(m => ({
+      contents: historyForRequest.map(m => ({
         role: m.role === 'assistant' ? 'model' : 'user',
         parts: [{ text: m.text }]
       })),
@@ -305,13 +318,28 @@ const CustomerView = () => {
       if (!res.ok) throw new Error('Failed to save order');
       const { order_id } = await res.json();
       setReceipt({ ...payload, order_id });
+      setMessages(INITIAL_MESSAGES);
+      messagesRef.current = INITIAL_MESSAGES;
     } catch (err) { console.error("Save Error", err); }
+  };
+
+  const stopTTS = () => {
+    if (ttsAudioRef.current) {
+      ttsAudioRef.current.pause();
+      if (ttsObjectUrlRef.current) {
+        URL.revokeObjectURL(ttsObjectUrlRef.current);
+        ttsObjectUrlRef.current = null;
+      }
+      ttsAudioRef.current = null;
+    }
+    window.speechSynthesis?.cancel();
   };
 
   const speak = async (text) => {
     if (!text?.trim()) return;
     if (voiceProvider === 'elevenlabs' && ELEVENLABS_API_KEY) {
       try {
+        stopTTS();
         const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
           method: 'POST',
           headers: {
@@ -324,8 +352,14 @@ const CustomerView = () => {
         if (!res.ok) throw new Error('TTS failed');
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
+        ttsObjectUrlRef.current = url;
         const audio = new Audio(url);
-        audio.onended = () => URL.revokeObjectURL(url);
+        ttsAudioRef.current = audio;
+        audio.onended = () => {
+          if (ttsObjectUrlRef.current) URL.revokeObjectURL(ttsObjectUrlRef.current);
+          ttsObjectUrlRef.current = null;
+          ttsAudioRef.current = null;
+        };
         await audio.play();
       } catch (err) {
         console.error('ElevenLabs TTS', err);
@@ -353,7 +387,7 @@ const CustomerView = () => {
           console.error('No Scribe token in response');
           return;
         }
-        const wsUrl = `wss://api.elevenlabs.io/v1/speech-to-text/realtime?token=${encodeURIComponent(token)}&model_id=scribe_v2_realtime&commit_strategy=vad&audio_format=pcm_16000`;
+        const wsUrl = `wss://api.elevenlabs.io/v1/speech-to-text/realtime?token=${encodeURIComponent(token)}&model_id=scribe_v2_realtime&commit_strategy=vad&audio_format=pcm_16000&vad_silence_threshold_secs=2`;
         const ws = new WebSocket(wsUrl);
         scribeWsRef.current = ws;
         scribeChunkBufferRef.current = [];
@@ -401,6 +435,9 @@ const CustomerView = () => {
         ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
+            if (data.message_type === 'partial_transcript' || data.message_type === 'committed_transcript') {
+              stopTTS();
+            }
             if (data.message_type === 'committed_transcript' && data.text?.trim()) {
               handleSendMessage(data.text.trim());
             }
