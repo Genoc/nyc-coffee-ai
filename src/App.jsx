@@ -15,8 +15,6 @@ import {
 
 // --- Configuration & Constants ---
 const API_BASE = import.meta.env.VITE_API_BASE || '';
-const apiKey = import.meta.env.VITE_GEMINI_API_KEY || '';
-const ELEVENLABS_API_KEY = import.meta.env.VITE_ELEVENLABS_API_KEY || '';
 const ELEVENLABS_VOICE_ID = import.meta.env.VITE_ELEVENLABS_VOICE_ID || '21m00Tcm4TlvDq8ikWAM';
 
 // Resample Float32 mono to 16kHz and return Int16 PCM as base64 (for ElevenLabs Scribe Realtime)
@@ -248,7 +246,7 @@ const CustomerView = () => {
 
   const callGeminiWithRetry = async (payload, retries = 5, delay = 1000) => {
     try {
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+      const response = await fetch(`${API_BASE}/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -361,17 +359,13 @@ const CustomerView = () => {
 
   const speak = async (text) => {
     if (!text?.trim()) return;
-    if (voiceProvider === 'elevenlabs' && ELEVENLABS_API_KEY) {
+    if (voiceProvider === 'elevenlabs') {
       try {
         stopTTS();
-        const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+        const res = await fetch(`${API_BASE}/api/elevenlabs-tts`, {
           method: 'POST',
-          headers: {
-            'xi-api-key': ELEVENLABS_API_KEY,
-            'Content-Type': 'application/json',
-            Accept: 'audio/mpeg'
-          },
-          body: JSON.stringify({ text: text.trim(), model_id: 'eleven_multilingual_v2' })
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: text.trim(), voiceId: ELEVENLABS_VOICE_ID })
         });
         if (!res.ok) throw new Error('TTS failed');
         const blob = await res.blob();

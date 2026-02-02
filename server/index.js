@@ -1,3 +1,7 @@
+// Required server env (never expose these to the frontend):
+// - GEMINI_API_KEY — for POST /api/generate (Gemini proxy)
+// - ELEVENLABS_API_KEY — for POST /api/elevenlabs-tts and GET /api/elevenlabs-scribe-token
+// - GOOGLE_SHEET_ID, GOOGLE_APPLICATION_CREDENTIALS_JSON — for orders
 import 'dotenv/config';
 import express from 'express';
 import path from 'path';
@@ -101,6 +105,67 @@ app.post('/api/orders', async (req, res) => {
   } catch (err) {
     console.error('POST /api/orders', err);
     res.status(500).json({ error: err.message || 'Failed to create order' });
+  }
+});
+
+// POST /api/generate — proxy Gemini so the API key stays server-side only
+app.post('/api/generate', async (req, res) => {
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) {
+    return res.status(503).json({ error: 'Gemini not configured (missing GEMINI_API_KEY)' });
+  }
+  try {
+    const { contents, systemInstruction } = req.body || {};
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${geminiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contents: contents || [], systemInstruction: systemInstruction || {} }),
+      }
+    );
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('Gemini API error', response.status, errText);
+      return res.status(response.status).json({ error: 'Gemini request failed' });
+    }
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    console.error('POST /api/generate', err);
+    res.status(500).json({ error: err.message || 'Failed to call Gemini' });
+  }
+});
+
+// POST /api/elevenlabs-tts — proxy TTS so the API key stays server-side only
+app.post('/api/elevenlabs-tts', async (req, res) => {
+  const apiKey = process.env.ELEVENLABS_API_KEY;
+  if (!apiKey) {
+    return res.status(503).json({ error: 'ElevenLabs not configured (missing ELEVENLABS_API_KEY)' });
+  }
+  try {
+    const { text, voiceId } = req.body || {};
+    const voice = voiceId || '21m00Tcm4TlvDq8ikWAM';
+    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voice}`, {
+      method: 'POST',
+      headers: {
+        'xi-api-key': apiKey,
+        'Content-Type': 'application/json',
+        Accept: 'audio/mpeg',
+      },
+      body: JSON.stringify({ text: (text || '').trim(), model_id: 'eleven_multilingual_v2' }),
+    });
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error('ElevenLabs TTS error', response.status, errText);
+      return res.status(response.status).json({ error: 'TTS failed' });
+    }
+    const buffer = await response.arrayBuffer();
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.send(Buffer.from(buffer));
+  } catch (err) {
+    console.error('POST /api/elevenlabs-tts', err);
+    res.status(500).json({ error: err.message || 'Failed to call TTS' });
   }
 });
 
